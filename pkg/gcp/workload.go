@@ -27,6 +27,7 @@ type GCPAccessToken struct {
 	TokenType   string    `json:"token_type"`
 	ExpiresIn   int       `json:"expires_in"`
 	ExpiresAt   time.Time `json:"expires_at"`
+	IDToken     string    `json:"id_token,omitempty"` // Store ID token for credential config
 }
 
 // NewWorkloadIdentityManager creates a new workload identity manager
@@ -51,6 +52,9 @@ func (wim *WorkloadIdentityManager) ExchangeTokenForGCPAccess(oidcToken *creds.O
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to impersonate service account")
 	}
+
+	// Store ID token for credential config file
+	accessToken.IDToken = oidcToken.IDToken
 
 	fmt.Println("✓ GCP access token obtained")
 	return accessToken, nil
@@ -185,11 +189,26 @@ func (wim *WorkloadIdentityManager) SaveAccessToken(accessToken *GCPAccessToken)
 		return "", errors.Wrap(err, "failed to write token file")
 	}
 
+	// Save ID token for credential source
+	idTokenFile := filepath.Join(credDir, fmt.Sprintf("%s-id-token.txt", wim.profile.Name))
+	if accessToken.IDToken != "" {
+		if err := os.WriteFile(idTokenFile, []byte(accessToken.IDToken), 0600); err != nil {
+			return "", errors.Wrap(err, "failed to write ID token file")
+		}
+	}
+
+	// Save credential configuration file (for GOOGLE_APPLICATION_CREDENTIALS)
+	credConfigFile := filepath.Join(credDir, fmt.Sprintf("%s-credentials.json", wim.profile.Name))
+	if err := wim.saveCredentialConfig(credConfigFile, idTokenFile); err != nil {
+		return "", errors.Wrap(err, "failed to save credential config")
+	}
+
 	// Also save metadata (expiry time) separately
 	metadataFile := filepath.Join(credDir, fmt.Sprintf("%s-metadata.json", wim.profile.Name))
 	metadata := map[string]interface{}{
-		"token_expiry": accessToken.ExpiresAt.Format(time.RFC3339),
-		"profile":      wim.profile.Name,
+		"token_expiry":         accessToken.ExpiresAt.Format(time.RFC3339),
+		"profile":              wim.profile.Name,
+		"credential_config":    credConfigFile,
 	}
 	metadataJSON, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
@@ -202,6 +221,36 @@ func (wim *WorkloadIdentityManager) SaveAccessToken(accessToken *GCPAccessToken)
 	return tokenFile, nil
 }
 
+// saveCredentialConfig saves Application Default Credentials format
+func (wim *WorkloadIdentityManager) saveCredentialConfig(configPath string, idTokenFilePath string) error {
+	// Create ADC-compatible credential config with file-based credential source
+	config := map[string]interface{}{
+		"type":                           "external_account",
+		"audience":                       fmt.Sprintf("//iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/providers/%s",
+			wim.profile.GCPProjectNumber,
+			wim.profile.GCPPoolID,
+			wim.profile.GCPProviderID),
+		"subject_token_type":             "urn:ietf:params:oauth:token-type:jwt",
+		"token_url":                      "https://sts.googleapis.com/v1/token",
+		"service_account_impersonation_url": fmt.Sprintf("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken",
+			wim.profile.GCPServiceAccount),
+		"credential_source": map[string]interface{}{
+			"file": idTokenFilePath,
+		},
+	}
+
+	// Save the credential config
+	configJSON, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(configPath, configJSON, 0600); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // GetEnvironmentVariables returns the environment variables to set for gcloud
 func (wim *WorkloadIdentityManager) GetEnvironmentVariables(tokenFile string) map[string]string {
 	env := make(map[string]string)
@@ -209,6 +258,13 @@ func (wim *WorkloadIdentityManager) GetEnvironmentVariables(tokenFile string) ma
 	// Read the access token from file
 	if tokenData, err := os.ReadFile(tokenFile); err == nil {
 		env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = string(tokenData)
+	}
+
+	// Set GOOGLE_APPLICATION_CREDENTIALS to the credential config file
+	homeDir, _ := homedir.Dir()
+	credConfigFile := filepath.Join(homeDir, ".config", "oidc2gcloud", fmt.Sprintf("%s-credentials.json", wim.profile.Name))
+	if _, err := os.Stat(credConfigFile); err == nil {
+		env["GOOGLE_APPLICATION_CREDENTIALS"] = credConfigFile
 	}
 
 	if wim.profile.GCPProject != "" {
@@ -221,14 +277,25 @@ func (wim *WorkloadIdentityManager) GetEnvironmentVariables(tokenFile string) ma
 // PrintUsageInstructions prints usage instructions
 func (wim *WorkloadIdentityManager) PrintUsageInstructions(tokenFile string) {
 	fmt.Println("\n✓ Authentication successful!")
+
+	homeDir, _ := homedir.Dir()
+	credConfigFile := filepath.Join(homeDir, ".config", "oidc2gcloud", fmt.Sprintf("%s-credentials.json", wim.profile.Name))
+
+	fmt.Println("\nCredentials saved:")
+	fmt.Printf("  Access Token: %s\n", tokenFile)
+	fmt.Printf("  Credentials Config: %s\n", credConfigFile)
+
 	fmt.Println("\nTo use gcloud with this authentication:")
-	fmt.Println("\nUse eval to set environment variables (recommended):")
+	fmt.Println("\nOption 1: Use eval to set environment variables (recommended):")
 	fmt.Printf("  eval $(oidc2gcloud env --profile %s)\n", wim.profile.Name)
+	fmt.Println("\nOption 2: Manually export environment variables:")
+	fmt.Printf("  export GOOGLE_APPLICATION_CREDENTIALS=%s\n", credConfigFile)
+	fmt.Printf("  export CLOUDSDK_CORE_PROJECT=%s\n", wim.profile.GCPProject)
+
 	fmt.Println("\nThen run gcloud commands:")
 	fmt.Printf("  gcloud compute instances list --project=%s\n", wim.profile.GCPProject)
 
 	// Calculate and display expiry
-	homeDir, _ := homedir.Dir()
 	metadataFile := filepath.Join(homeDir, ".config", "oidc2gcloud", fmt.Sprintf("%s-metadata.json", wim.profile.Name))
 	if data, err := os.ReadFile(metadataFile); err == nil {
 		var metadata map[string]interface{}
